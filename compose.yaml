@@ -1,0 +1,96 @@
+# vLLM v0.31.0 on two Arc Pro B70s with tensor parallelism. README.md explains the flags,
+# which constrain each other.
+x-image: &image vllm/vllm-openai-xpu@sha256:95ac815038c4b3537b173798bfe3b89bdf525a52bd653cd14d4deb01f1062be7
+
+services:
+  # The Kubernetes init container. snapshot_download resumes a partial download.
+  fetch-weights:
+    image: *image
+    working_dir: /
+    entrypoint:
+      - python3
+      - -c
+      - |
+        import os
+        from huggingface_hub import snapshot_download
+        snapshot_download(os.environ["MODEL_REPO"], local_dir=os.environ["MODEL_DIR"], max_workers=4)
+    environment:
+      MODEL_REPO: pramoths/Qwen3.8-27B-Uncensored-FP8-MTP
+      MODEL_DIR: /models/Qwen3.8-27B-Uncensored-FP8-MTP
+      HF_HOME: /models/.hf
+      HF_HUB_ENABLE_HF_TRANSFER: "0"
+    volumes:
+      - ./models:/models
+
+  vllm:
+    image: *image
+    depends_on:
+      fetch-weights:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # /workspace/vllm would shadow the installed package the patches edit.
+    working_dir: /
+    # Patch, refusing to serve if either patch fails, then hand the arguments to vllm serve.
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        python3 /patches/patch_vllm_worker_affinity.py | tee /tmp/affinity.log
+        grep -q "All worker affinity patches installed successfully." /tmp/affinity.log
+        python3 /patches/patch_fp8_stack.py
+        exec vllm serve "$$@"
+      - vllm
+    command:
+      - --model=/models/Qwen3.8-27B-Uncensored-FP8-MTP
+      - --served-model-name=Qwen/Qwen3.8-27B
+      - --chat-template=/models/Qwen3.8-27B-Uncensored-FP8-MTP/chat_template.jinja
+      - --language-model-only
+      - --tensor-parallel-size=2
+      - --kv-cache-dtype=fp8
+      - --max-model-len=153600
+      - --enable-prefix-caching
+      - --prefix-match-unit=64
+      - --enable-mamba-shared-prefix-checkpoint
+      - --gpu-memory-utilization=0.90
+      - --kv-cache-memory-bytes=11542724608
+      - --max-num-seqs=64
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":2}'
+      - --max-num-batched-tokens=8192
+      - --reasoning-parser=qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser=qwen3_xml
+      - --host=0.0.0.0
+      - --port=8000
+    environment:
+      ONEAPI_DEVICE_SELECTOR: level_zero:*
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      ZE_AFFINITY_MASK: "0,1"
+      B70_WORKER_AFFINITY: "1"
+      # oneCCL's peer-device IPC algorithm fails between B70s without P2P.
+      CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD: "4294967296"
+      CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD: "4294967296"
+      CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD: "4294967296"
+      CCL_SYCL_ALLTOALL_TMP_BUF: "1"
+      HF_HOME: /models/.hf
+      VLLM_API_KEY: ${VLLM_API_KEY:?set VLLM_API_KEY in .env}
+    # Both cards whole. The Kubernetes version gets these through the Intel device plugin.
+    devices:
+      - /dev/dri:/dev/dri
+    # The cookbook's dual-B70 contract: host IPC, and SYS_PTRACE for oneCCL's pidfd handle exchange.
+    ipc: host
+    cap_add:
+      - SYS_PTRACE
+    mem_limit: 24g
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models
+      - ./patches:/patches:ro
+    # Load and graph capture take about 4 minutes on two cards.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30m
